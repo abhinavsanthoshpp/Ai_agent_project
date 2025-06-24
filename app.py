@@ -1,12 +1,37 @@
+import os
 import spacy
 import datetime
 import requests
 import random
 import json
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
+import nltk
+
+from flask import Flask, request, render_template, session, redirect, url_for
+from flask.sessions import SecureCookieSessionInterface # For session management
+
+# --- NLTK Data Download (Run once if needed) ---
+# To ensure 'vader_lexicon' is downloaded, you might need to run this outside the Flask app context once:
+# python -c "import nltk; nltk.download('vader_lexicon')"
+try:
+    _ = nltk.data.find('sentiment/vader_lexicon.zip')
+except LookupError:
+    print("NLTK 'vader_lexicon' not found. Attempting to download...")
+    nltk.download('vader_lexicon')
+    print("NLTK 'vader_lexicon' downloaded.")
+
+# --- Initialize Flask App ---
+app = Flask(__name__)
+# IMPORTANT: Set a secret key for session management!
+# This should be a long, random string. NEVER share this publicly.
+app.secret_key = os.urandom(24) # Generates a random 24-byte key for security
+
+# --- Global Configurations and Initializations (loaded once when app starts) ---
+analyzer = SentimentIntensityAnalyzer() # Initialize VADER sentiment analyzer
 
 OPENWEATHERMAP_API_KEY = "2f63df4ee626ff5667b0f2939c3c33ee" # YOUR API KEY
 BASE_WEATHER_URL = "http://api.openweathermap.org/data/2.5/weather"
-USER_DATA_FILE = "user_data.json"
+USER_DATA_FILE = "user_data.json" # File to store persistent user preferences
 
 try:
     nlp = spacy.load("en_core_web_sm")
@@ -15,7 +40,10 @@ except OSError:
     spacy.cli.download("en_core_web_sm")
     nlp = spacy.load("en_core_web_sm")
 
+# --- Helper Functions (from your original agent.py) ---
+
 def get_current_weather(city):
+    """Fetches current weather data for a given city from OpenWeatherMap API."""
     params = {
         "q": city,
         "appid": OPENWEATHERMAP_API_KEY,
@@ -39,6 +67,7 @@ def get_current_weather(city):
         return {"city": city, "temperature": "N/A", "conditions": "error"}
 
 def load_user_data():
+    """Loads user preferences from a JSON file."""
     try:
         with open(USER_DATA_FILE, 'r') as f:
             return json.load(f)
@@ -49,10 +78,11 @@ def load_user_data():
         return {}
 
 def save_user_data(data):
+    """Saves user preferences to a JSON file."""
     with open(USER_DATA_FILE, 'w') as f:
         json.dump(data, f, indent=4)
 
-
+# Static knowledge base and predefined responses
 static_knowledge = {
     "agent_name": "AI Assistant Prototype",
     "agent_purpose": "I am designed to help with basic tasks like weather information and scheduling.",
@@ -74,6 +104,9 @@ static_knowledge = {
     "help_response": "I can help you with weather updates, scheduling meetings, and answering general questions about myself. Try asking 'What's the weather in London?' or 'Schedule a meeting for tomorrow.' You can also ask 'who are you?'",
     "set_preferred_city_prompt": "What city would you like to set as your preferred weather city?",
     "preferred_city_set_confirm": "Okay, I've set your preferred weather city to {city}.",
+    "reassurance_response": "I understand you might be feeling frustrated, but I'm here to help. What can I do for you?",
+    "positive_acknowledgement": "That sounds great! How can I assist further?",
+    "negative_acknowledgement": "I'm sorry to hear that. How can I help resolve this?"
 }
 
 intent_keywords = {
@@ -90,6 +123,10 @@ intent_keywords = {
 }
 
 def recognize_intent_spacy(user_input):
+    """
+    Recognizes the user's intent based on keywords in the input.
+    Returns the intent name and a simple confidence score.
+    """
     doc = nlp(user_input.lower())
     for intent, keywords in intent_keywords.items():
         for keyword in keywords:
@@ -98,6 +135,10 @@ def recognize_intent_spacy(user_input):
     return "unknown", 0.5
 
 def extract_entities(user_input, intent):
+    """
+    Extracts relevant entities (like city, date, time) from user input
+    based on the recognized intent using spaCy's NER.
+    """
     doc = nlp(user_input)
     entities = {}
 
@@ -114,52 +155,75 @@ def extract_entities(user_input, intent):
                 entities["time"] = ent.text
     return entities
 
-conversation_context = {
-    "unknown_count": 0
-}
+def get_sentiment(text):
+    """
+    Analyzes the sentiment of the input text using VADER.
+    Returns 'positive', 'negative', or 'neutral'.
+    """
+    scores = analyzer.polarity_scores(text)
+    if scores['compound'] >= 0.05:
+        return 'positive'
+    elif scores['compound'] <= -0.05:
+        return 'negative'
+    else:
+        return 'neutral'
 
+# --- Main Response Generation Logic ---
 def generate_response(user_input, intent, entities=None, user_prefs=None, confidence=1.0):
-    global conversation_context
+    """
+    Generates the agent's response based on intent, extracted entities,
+    conversation context, user preferences, and confidence.
+    Now also considers user sentiment.
+    """
+    # Use Flask's session for short-term conversation context (per user)
+    # If starting a new session, initialize conversation_context
+    if 'conversation_context' not in session:
+        session['conversation_context'] = {"unknown_count": 0}
+    conversation_context = session['conversation_context']
 
     if entities is None:
         entities = {}
     if user_prefs is None:
         user_prefs = {}
 
+    user_sentiment = get_sentiment(user_input)
+
+    # --- 1. Handle Confirmation Workflow (Highest Priority) ---
     if conversation_context.get("awaiting_confirmation") == "schedule_meeting":
         user_input_lower = user_input.lower()
         if "yes" in user_input_lower or "yup" in user_input_lower or "confirm" in user_input_lower:
             date = conversation_context.get("pending_schedule_date")
             time = conversation_context.get("pending_schedule_time")
             response = f"Great! The meeting has been confirmed for {date} at {time}."
-            conversation_context.clear()
-            conversation_context["unknown_count"] = 0
+            session['conversation_context'] = {"unknown_count": 0} # Clear context
             return response
         elif "no" in user_input_lower or "nope" in user_input_lower or "cancel" in user_input_lower:
             response = "Okay, I've cancelled that scheduling request. Is there something else I can help with?"
-            conversation_context.clear()
-            conversation_context["unknown_count"] = 0
+            session['conversation_context'] = {"unknown_count": 0} # Clear context
             return response
         else:
             response = "I'm still waiting for your confirmation (Yes/No) for the meeting. Or do you want to cancel?"
             return response
 
+    # --- 2. Initial Handling of 'unknown' Intent and Confidence ---
     if intent == "unknown":
         conversation_context["unknown_count"] = conversation_context.get("unknown_count", 0) + 1
         if confidence < 0.8 and conversation_context["unknown_count"] < 3:
             response = static_knowledge["low_confidence_response"]
         elif confidence < 0.8 and conversation_context["unknown_count"] >= 3:
             response = "It seems I'm having a lot of trouble understanding you. Perhaps you could try asking one of my main capabilities? " + static_knowledge["help_response"]
-            conversation_context.clear()
-            conversation_context["unknown_count"] = 0
+            session['conversation_context'] = {"unknown_count": 0} # Clear context
         else:
             response = static_knowledge["unknown_response"]
     else:
         conversation_context["unknown_count"] = 0
 
 
+    # --- 3. Intent-Based Responses (Main Logic) ---
     if intent == "get_weather":
-        city = entities.get("city") or conversation_context.get("last_weather_city")
+        city = entities.get("city")
+        if not city:
+            city = conversation_context.get("last_weather_city")
         if not city and user_prefs.get("preferred_weather_city"):
             city = user_prefs["preferred_weather_city"]
         
@@ -207,16 +271,20 @@ def generate_response(user_input, intent, entities=None, user_prefs=None, confid
 
     elif intent == "greet":
         response = random.choice(static_knowledge["greetings_info"])
-        conversation_context.clear()
-        conversation_context["unknown_count"] = 0
+        if user_sentiment == 'positive':
+            response += " It's great to hear from you!"
+        session['conversation_context'] = {"unknown_count": 0} # Clear context
 
     elif intent == "thank_you":
         response = static_knowledge["thank_you_response"]
+        if user_sentiment == 'positive':
+            response += " Glad I could help!"
+        elif user_sentiment == 'negative':
+            response += " I hope everything else is okay."
 
     elif intent == "exit":
         response = static_knowledge["goodbye_response"]
-        conversation_context.clear()
-        conversation_context["unknown_count"] = 0
+        session['conversation_context'] = {"unknown_count": 0} # Clear context
 
     elif intent == "about_agent":
         response = static_knowledge["agent_name"] + ". " + static_knowledge["agent_purpose"] + " " + static_knowledge["developer_info"]
@@ -228,9 +296,11 @@ def generate_response(user_input, intent, entities=None, user_prefs=None, confid
         response = f"The current year is {static_knowledge['current_year']}."
 
     elif intent == "help":
-        response = static_knowledge["help_response"]
-        conversation_context.clear()
-        conversation_context["unknown_count"] = 0
+        if user_sentiment == 'negative':
+            response = static_knowledge["reassurance_response"] + " " + static_knowledge["help_response"]
+        else:
+            response = static_knowledge["help_response"]
+        session['conversation_context'] = {"unknown_count": 0} # Clear context
 
     elif intent == "set_preferred_city":
         city = entities.get("city")
@@ -242,7 +312,10 @@ def generate_response(user_input, intent, entities=None, user_prefs=None, confid
             response = static_knowledge["set_preferred_city_prompt"]
             conversation_context["awaiting_preferred_city"] = True
 
-    if intent == "unknown":
+    # --- 4. Context-based Fallback/Clarification (if intent wasn't directly handled by specific intent) ---
+    else: # This block catches cases where a specific intent (other than 'unknown') wasn't fully processed,
+          # or if the initial intent was 'unknown' but could be resolved by context.
+
         if conversation_context.get("awaiting_city_for_weather"):
             new_doc = nlp(user_input)
             for ent in new_doc.ents:
@@ -260,7 +333,8 @@ def generate_response(user_input, intent, entities=None, user_prefs=None, confid
                     conversation_context["unknown_count"] = 0
                     return response
             else:
-                pass
+                response = "Could you please specify the city for the weather?"
+                return response
 
         elif conversation_context.get("awaiting_preferred_city"):
             new_doc = nlp(user_input)
@@ -273,7 +347,8 @@ def generate_response(user_input, intent, entities=None, user_prefs=None, confid
                     conversation_context["unknown_count"] = 0
                     return response
             else:
-                pass
+                response = "I didn't catch a city. What city would you like to set as your preferred weather city?"
+                return response
 
         elif conversation_context.get("awaiting_meeting_details"):
             new_doc = nlp(user_input)
@@ -308,37 +383,61 @@ def generate_response(user_input, intent, entities=None, user_prefs=None, confid
                 conversation_context["unknown_count"] = 0
                 return response
 
+    # If no specific intent or context matched, the initial 'response' (unknown, low_confidence, etc.) stands
     return response
 
+# --- Flask Routes ---
 
-if __name__ == "__main__":
-    user_preferences = load_user_data()
-    print(f"Loaded user preferences: {user_preferences}")
+@app.route('/', methods=['GET', 'POST'])
+def chat():
+    user_message = ""
+    agent_response = ""
+    user_preferences = load_user_data() # Load user_data for each request
 
-    if not user_preferences.get("has_been_welcomed", False):
-        print("\nAgent: Hello! I'm your AI Assistant Prototype. I'm here to help you with some tasks.")
-        print("Agent: I can get you weather updates, help schedule meetings, and answer some general questions about myself.")
-        print("Agent: Type 'help' if you want to see a list of things I can do.")
-        print("Agent: Let's get started!")
-        user_preferences["has_been_welcomed"] = True
-        save_user_data(user_preferences)
-    else:
-        print(random.choice(static_knowledge["greetings_info"]))
-        print("Agent: What can I do for you today? (Type 'help' for options)")
+    # Initialize conversation history in session if it doesn't exist
+    if 'chat_history' not in session:
+        session['chat_history'] = []
+        # Initial welcome message only if first time visiting the app
+        if not user_preferences.get("has_been_welcomed", False):
+            welcome_message = "\nHello! I'm your AI Assistant Prototype. I'm here to help you with some tasks." \
+                              "\nI can get you weather updates, help schedule meetings, and answer some general questions about myself." \
+                              "\nType 'help' if you want to see a list of things I can do." \
+                              "\nLet's get started!"
+            session['chat_history'].append({"sender": "Agent", "message": welcome_message})
+            user_preferences["has_been_welcomed"] = True
+            save_user_data(user_preferences)
+        else:
+            session['chat_history'].append({"sender": "Agent", "message": random.choice(static_knowledge["greetings_info"]) + " What can I do for you today? (Type 'help' for options)"})
 
-    print("\nType 'bye' or 'exit' to quit.")
 
-    while True:
-        user_message = input("You: ")
+    if request.method == 'POST':
+        user_message = request.form['user_input']
+        session['chat_history'].append({"sender": "You", "message": user_message})
 
         intent_name, confidence = recognize_intent_spacy(user_message)
         extracted_entities = extract_entities(user_message, intent_name)
 
         agent_response = generate_response(user_message, intent_name, extracted_entities, user_preferences, confidence)
+        
+        session['chat_history'].append({"sender": "Agent", "message": agent_response})
+        
+        # Save user preferences after each interaction (if they might have changed)
+        save_user_data(user_preferences)
 
-        print(f"Agent: {agent_response}")
-
+        # Handle exit intent - clear session and redirect to show goodbye
         if intent_name == "exit":
-            save_user_data(user_preferences)
-            print("User data saved. Goodbye!")
-            break
+            final_goodbye = static_knowledge["goodbye_response"]
+            session['chat_history'].append({"sender": "Agent", "message": final_goodbye})
+            session.clear() # Clear session for a new conversation on refresh/revisit
+            save_user_data(user_preferences) # Ensure user_preferences are saved one last time
+            return render_template('index.html', chat_history=session['chat_history']) # Render with goodbye
+
+    # Update session context after processing each request
+    session.modified = True 
+    return render_template('index.html', chat_history=session['chat_history'])
+
+# --- Run Flask App ---
+if __name__ == '__main__':
+    # When running locally, set debug=True for automatic reloading on code changes
+    # and more detailed error messages. Remember to turn off in production.
+    app.run(debug=True) # debug=True is good for development
