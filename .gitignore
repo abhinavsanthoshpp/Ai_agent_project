@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+# My specific files to ignore
+*.log
+*.sqlite3
+*.db
+user_data.json # Ignore the user data file, as it's specific to your local runs
